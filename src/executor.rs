@@ -47,6 +47,12 @@ where
         }
     }
 
+    fn remove_consumer(&mut self, id: u32) {
+        if let None = self.wakers.remove(&id) {
+            log::warn!("Remove of consumer \"{}\" failed.", id);
+        }
+    }
+
     fn new_consumer(consumers: Arc<Mutex<Self>>) -> CompFuture<T> {
         let id = {
             let mut lock = consumers.lock().unwrap();
@@ -68,6 +74,16 @@ where
 {
     id: u32,
     state: Arc<Mutex<ComputationConsumers<T>>>,
+}
+
+impl<T> Drop for CompFuture<T>
+where
+    T: Clone,
+{
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        state.remove_consumer(self.id);
+    }
 }
 
 impl<T> Future for CompFuture<T>
@@ -94,7 +110,7 @@ where
 /// to notify waiting consumers independent if the computation
 /// succeeds or fails.
 /// This handle resolves to a `KeyedResult`
-#[pin_project::pin_project(project=KeyedJoinHandleProjection)]
+#[pin_project::pin_project]
 struct KeyedJoinHandle<K, T>
 where
     K: Clone,
@@ -234,7 +250,7 @@ where
                     }
                     // Notify consumers
                     for w in cs.wakers.values() {
-                        w.clone().wake();
+                        w.wake_by_ref();
                     }
                 }
             }
