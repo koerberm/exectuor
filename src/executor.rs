@@ -48,7 +48,7 @@ where
     }
 
     fn remove_consumer(&mut self, id: u32) {
-        if let None = self.wakers.remove(&id) {
+        if self.wakers.remove(&id).is_none() {
             log::warn!("Remove of consumer \"{}\" failed.", id);
         }
     }
@@ -268,7 +268,7 @@ where
     /// # Return
     /// A future resolving to the result of the given `computation`
     ///
-    pub async fn compute(
+    pub async fn submit(
         &self,
         key: &Key,
         computation: impl Future<Output = T> + Send + 'static,
@@ -318,11 +318,11 @@ mod tests {
         init_logger();
 
         let e = Executor::new();
-        let f = e.compute(&1, async { 2_u64 });
+        let f = e.submit(&1, async { 2_u64 });
 
         assert_eq!(2_u64, f.await?);
 
-        let f = e.compute(&1, async { 42_u64 });
+        let f = e.submit(&1, async { 42_u64 });
         assert_eq!(42_u64, f.await?);
 
         Ok(())
@@ -334,16 +334,16 @@ mod tests {
 
         let e = Executor::new();
         // We use arc here to ensure both actually return the same result
-        let f = e.compute(&1, async { Arc::new(2_u64) });
-        let f2 = e.compute(&1, async { Arc::new(2_u64) });
+        let f = e.submit(&1, async { Arc::new(2_u64) });
+        let f2 = e.submit(&1, async { Arc::new(2_u64) });
 
         let (r1, r2) = tokio::join!(f, f2);
         let (r1, r2) = (r1?, r2?);
 
         assert!(Arc::ptr_eq(&r1, &r2));
 
-        let f = e.compute(&1, async { Arc::new(2_u64) });
-        let f2 = e.compute(&1, async { Arc::new(2_u64) });
+        let f = e.submit(&1, async { Arc::new(2_u64) });
+        let f2 = e.submit(&1, async { Arc::new(2_u64) });
 
         let r1 = f.await?;
         let r2 = f2.await?;
@@ -357,7 +357,7 @@ mod tests {
         init_logger();
 
         let e = Executor::new();
-        let f = e.compute(&1, async { panic!("booom") });
+        let f = e.submit(&1, async { panic!("booom") });
 
         match f.await.unwrap_err() {
             ExecutorError::TaskPanic => {}
@@ -365,7 +365,7 @@ mod tests {
         };
 
         // Ensure other tasks are running
-        let f = e.compute(&1, async { 42_u64 });
+        let f = e.submit(&1, async { 42_u64 });
         assert_eq!(42_u64, f.await?);
         Ok(())
     }
@@ -375,7 +375,7 @@ mod tests {
         init_logger();
 
         let e = Executor::new();
-        let f = e.compute(&1, async { 2_u64 });
+        let f = e.submit(&1, async { 2_u64 });
         assert_eq!(2_u64, f.await?);
         let c = e.close();
         c.await?;
