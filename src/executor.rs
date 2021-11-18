@@ -10,31 +10,27 @@ use std::task::{Context, Poll, Waker};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::{JoinError, JoinHandle};
 
-/// Manages the consumers of a computation
-/// by holding a map of wakers to notify upon
-/// completion.
-struct ComputationConsumers<T> {
-    consumer_count: u32,
+/// Dispatches the results of a computation
+/// to the attached consumers.
+struct ComputationDispatcher<T> {
+    consumer_id_seq: u32,
     result: Option<Result<Arc<T>>>,
     wakers: HashMap<u32, Waker>,
 }
 
-impl<T> ComputationConsumers<T>
-where
-    T: Clone,
-{
+impl<T> ComputationDispatcher<T> {
     /// Creates a new `ComputationConsumers` with an
     /// empty result and no attached consumers.
-    fn new() -> ComputationConsumers<T> {
-        ComputationConsumers {
-            consumer_count: 0,
+    fn new() -> ComputationDispatcher<T> {
+        ComputationDispatcher {
+            consumer_id_seq: 0,
             result: None,
             wakers: HashMap::new(),
         }
     }
 
     /// Attaches/updates a consumer for this computation.
-    fn update_waker(&mut self, cf: &CompFuture<T>, w: &Waker) {
+    fn update_waker(&mut self, cf: &ComputationConsumer<T>, w: &Waker) {
         match self.wakers.entry(cf.id) {
             std::collections::hash_map::Entry::Occupied(mut oe) => {
                 if !oe.get().will_wake(w) {
@@ -47,55 +43,50 @@ where
         }
     }
 
+    fn next_id(&mut self) -> u32 {
+        let res = self.consumer_id_seq;
+        self.consumer_id_seq += 1;
+        res
+    }
+
     fn remove_consumer(&mut self, id: u32) {
         if self.wakers.remove(&id).is_none() {
             log::warn!("Remove of consumer \"{}\" failed.", id);
-        }
-    }
-
-    fn new_consumer(consumers: Arc<Mutex<Self>>) -> CompFuture<T> {
-        let id = {
-            let mut lock = consumers.lock().unwrap();
-            lock.consumer_count += 1;
-            lock.consumer_count - 1
-        };
-        CompFuture {
-            id,
-            state: consumers,
         }
     }
 }
 
 /// Future representing the result of a computation
 /// the is run by the `Executor`
-struct CompFuture<T>
-where
-    T: Clone,
-{
+struct ComputationConsumer<T> {
     id: u32,
-    state: Arc<Mutex<ComputationConsumers<T>>>,
+    state: Arc<Mutex<ComputationDispatcher<T>>>,
 }
 
-impl<T> Drop for CompFuture<T>
-where
-    T: Clone,
-{
+impl<T> ComputationConsumer<T> {
+    fn new(state: Arc<Mutex<ComputationDispatcher<T>>>) -> ComputationConsumer<T> {
+        let id = {
+            let mut lock = state.lock().unwrap();
+            lock.next_id()
+        };
+        ComputationConsumer { id, state }
+    }
+}
+
+impl<T> Drop for ComputationConsumer<T> {
     fn drop(&mut self) {
         let mut state = self.state.lock().unwrap();
         state.remove_consumer(self.id);
     }
 }
 
-impl<T> Future for CompFuture<T>
-where
-    T: Clone,
-{
-    type Output = Result<T>;
+impl<T> Future for ComputationConsumer<T> {
+    type Output = Result<Arc<T>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut l = self.state.lock().unwrap();
         match &l.result {
-            Some(Ok(v)) => Poll::Ready(Ok(v.as_ref().clone())),
+            Some(Ok(v)) => Poll::Ready(Ok(v.clone())),
             Some(Err(e)) => Poll::Ready(Err(e.clone())),
             None => {
                 l.update_waker(&self, cx.waker());
@@ -152,10 +143,9 @@ where
 struct KeyedComputation<Key, T>
 where
     Key: Hash + Clone + Eq + Send + 'static,
-    T: Clone,
 {
     key: Key,
-    response: tokio::sync::oneshot::Sender<CompFuture<T>>,
+    response: tokio::sync::oneshot::Sender<ComputationConsumer<T>>,
     computation: BoxFuture<'static, T>,
 }
 
@@ -167,7 +157,7 @@ where
 pub struct Executor<Key, T>
 where
     Key: Hash + Clone + Eq + Send + 'static,
-    T: Clone + Sync + Send + 'static,
+    T: Sync + Send + 'static,
 {
     sender: Sender<KeyedComputation<Key, T>>,
     _driver: JoinHandle<()>,
@@ -176,7 +166,7 @@ where
 impl<Key, T> Executor<Key, T>
 where
     Key: Hash + Clone + Eq + Send + 'static,
-    T: Clone + Sync + Send + 'static,
+    T: Sync + Send + 'static,
 {
     /// Creates a new `Executor` instance, ready to serve computations.
     pub fn new() -> Executor<Key, T> {
@@ -194,7 +184,7 @@ where
 
     async fn executor_loop(mut receiver: Receiver<KeyedComputation<Key, T>>) {
         log::info!("Starting executor loop.");
-        let mut computations: HashMap<Key, Arc<Mutex<ComputationConsumers<T>>>> = HashMap::new();
+        let mut computations: HashMap<Key, Arc<Mutex<ComputationDispatcher<T>>>> = HashMap::new();
         let mut tasks = FuturesUnordered::<KeyedJoinHandle<Key, T>>::new();
         loop {
             tokio::select! {
@@ -211,7 +201,7 @@ where
                             // Start a new computation
                             std::collections::hash_map::Entry::Vacant(ve) => {
                                 log::debug!("Starting new computation for request.");
-                                let state = Arc::new(Mutex::new(ComputationConsumers::new()));
+                                let state = Arc::new(Mutex::new(ComputationDispatcher::new()));
                                 ve.insert(state.clone());
 
                                 let jh = tokio::spawn(async move {
@@ -222,7 +212,7 @@ where
                             }
                         };
 
-                        let fut = ComputationConsumers::new_consumer(state);
+                        let fut = ComputationConsumer::new(state);
                         if kc.response.send(fut).is_err() {
                             log::error!("Could not pass back computation future.")
                         }
@@ -236,7 +226,7 @@ where
                     let completed_task: KeyedComputationResult<Key,T> = completed_task;
 
                     // Get the state and remove it from the map.
-                    let cs: Arc<Mutex<ComputationConsumers<T>>> = computations.remove(&completed_task.key).expect("Entry must be present");
+                    let cs: Arc<Mutex<ComputationDispatcher<T>>> = computations.remove(&completed_task.key).expect("Entry must be present");
                     let mut cs = cs.lock().unwrap();
                     match completed_task.result {
                         Err(e) => {
@@ -272,8 +262,8 @@ where
         &self,
         key: &Key,
         computation: impl Future<Output = T> + Send + 'static,
-    ) -> Result<T> {
-        let (tx, rx) = tokio::sync::oneshot::channel::<CompFuture<T>>();
+    ) -> Result<Arc<T>> {
+        let (tx, rx) = tokio::sync::oneshot::channel::<ComputationConsumer<T>>();
 
         let kc = KeyedComputation {
             key: key.clone(),
@@ -296,17 +286,59 @@ where
 impl<Key, T> Default for Executor<Key, T>
 where
     Key: Hash + Clone + Eq + Send + 'static,
-    T: Clone + Sync + Send + 'static,
+    T: Sync + Send + 'static,
 {
     fn default() -> Self {
         Self::new()
     }
 }
 
+/// Trait for streams with cloneable results.
+#[async_trait::async_trait]
+trait CloneableComputation<Key, T>
+where
+    Key: Hash + Clone + Eq + Send + 'static,
+    T: Clone + Sync + Send + 'static,
+{
+    /// Submits a computation to this executor. The is used to uniquely
+    /// identify the computation and lets multiple identical computations
+    /// use the same result.
+    ///
+    /// The caller is responsible for ensuring that the given key is unique
+    /// per computation.
+    ///
+    /// Unlike with `Executor::submit` which returns an `Arc<T>` to the
+    /// consumers, this methods returns a `T`, by cloning the result.
+    ///
+    /// # Return
+    /// A future resolving to the result of the given `stream`
+    ///
+    async fn submit_clone<F>(&self, key: &Key, stream: F) -> Result<T>
+    where
+        F: Future<Output = T> + Send + 'static;
+}
+
+#[async_trait::async_trait]
+impl<Key, T> CloneableComputation<Key, T> for Executor<Key, T>
+where
+    Key: Hash + Clone + Eq + Send + Sync + 'static,
+    T: Clone + Sync + Send + 'static,
+{
+    async fn submit_clone<F>(&self, key: &Key, computation: F) -> Result<T>
+    where
+        F: Future<Output = T> + Send + 'static,
+    {
+        match self.submit(key, computation).await {
+            Ok(v) => Ok(v.as_ref().clone()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::error::ExecutorError;
-    use crate::executor::Executor;
+    use crate::executor::{CloneableComputation, Executor};
     use std::sync::Arc;
 
     fn init_logger() {
@@ -320,10 +352,10 @@ mod tests {
         let e = Executor::new();
         let f = e.submit(&1, async { 2_u64 });
 
-        assert_eq!(2_u64, f.await?);
+        assert_eq!(Arc::new(2_u64), f.await?);
 
         let f = e.submit(&1, async { 42_u64 });
-        assert_eq!(42_u64, f.await?);
+        assert_eq!(Arc::new(42_u64), f.await?);
 
         Ok(())
     }
@@ -334,16 +366,16 @@ mod tests {
 
         let e = Executor::new();
         // We use arc here to ensure both actually return the same result
-        let f = e.submit(&1, async { Arc::new(2_u64) });
-        let f2 = e.submit(&1, async { Arc::new(2_u64) });
+        let f = e.submit(&1, async { 2_u64 });
+        let f2 = e.submit(&1, async { 2_u64 });
 
         let (r1, r2) = tokio::join!(f, f2);
         let (r1, r2) = (r1?, r2?);
 
         assert!(Arc::ptr_eq(&r1, &r2));
 
-        let f = e.submit(&1, async { Arc::new(2_u64) });
-        let f2 = e.submit(&1, async { Arc::new(2_u64) });
+        let f = e.submit(&1, async { 2_u64 });
+        let f2 = e.submit(&1, async { 2_u64 });
 
         let r1 = f.await?;
         let r2 = f2.await?;
@@ -366,7 +398,7 @@ mod tests {
 
         // Ensure other tasks are running
         let f = e.submit(&1, async { 42_u64 });
-        assert_eq!(42_u64, f.await?);
+        assert_eq!(Arc::new(42_u64), f.await?);
         Ok(())
     }
 
@@ -376,10 +408,20 @@ mod tests {
 
         let e = Executor::new();
         let f = e.submit(&1, async { 2_u64 });
-        assert_eq!(2_u64, f.await?);
+        assert_eq!(Arc::new(2_u64), f.await?);
         let c = e.close();
         c.await?;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_clone() -> Result<(), ExecutorError> {
+        init_logger();
+
+        let e = Executor::new();
+        let f = e.submit_clone(&1, async { 2_u64 });
+        assert_eq!(2_u64, f.await?);
         Ok(())
     }
 }
