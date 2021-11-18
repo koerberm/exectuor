@@ -1,10 +1,11 @@
+use snafu::Snafu;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::task::JoinError;
 
 pub type Result<T> = std::result::Result<T, ExecutorError>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Snafu)]
 pub enum ExecutorError {
     TaskSubmission { message: String },
     TaskPanic,

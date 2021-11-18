@@ -48,14 +48,11 @@ impl StreamConsumerState {
 
 /// Dispatches the results of a source stream
 /// to the attached consumers.
-struct StreamDispatcher<T>
-where
-    T: Clone,
-{
+struct StreamDispatcher<T> {
     // A simple id sequence to identify consumers
     consumer_id_seq: u32,
     // The buffer for elements obtained from the stream.
-    buffer: VecDeque<T>,
+    buffer: VecDeque<Arc<T>>,
     // If an element was processed by all attached consumers, we discard it from the queue
     // and increase the offset to ensure a proper mapping of consumer indexes to the
     // buffer deque.
@@ -66,10 +63,7 @@ where
     consumer_states: HashMap<u32, StreamConsumerState>,
 }
 
-impl<T> StreamDispatcher<T>
-where
-    T: Clone,
-{
+impl<T> StreamDispatcher<T> {
     /// Creates a new stream dispatcher.
     fn new() -> StreamDispatcher<T> {
         StreamDispatcher {
@@ -90,7 +84,7 @@ where
 
     /// Adds a new element of the source stream to this dispatcher
     fn new_element(&mut self, elem: T) {
-        self.buffer.push_back(elem);
+        self.buffer.push_back(Arc::new(elem));
         self.notify_wakers(self.offset + self.buffer.len() - 1);
     }
 
@@ -114,7 +108,7 @@ where
 
     /// Retrieves the next stream element for the given consumer and
     /// updates the corresponding `Waker` if required.
-    fn next(&mut self, consumer_id: u32, waker: &Waker) -> Poll<Result<Option<T>>> {
+    fn next(&mut self, consumer_id: u32, waker: &Waker) -> Poll<Result<Option<Arc<T>>>> {
         // Fetch the consumer state
         let consumer = match self.consumer_states.entry(consumer_id) {
             std::collections::hash_map::Entry::Occupied(oe) => oe.into_mut(),
@@ -161,18 +155,12 @@ where
 
 /// A stream consumer is itself a stream that delivers elements of the
 /// source stream at the consumer's pace.
-struct StreamConsumer<T>
-where
-    T: Clone,
-{
+pub struct StreamConsumer<T> {
     id: u32,
     parent: Arc<Mutex<StreamDispatcher<T>>>,
 }
 
-impl<T> StreamConsumer<T>
-where
-    T: Clone,
-{
+impl<T> StreamConsumer<T> {
     /// Creates a new consumer for the given `StreamDispatcher`
     fn new(state: Arc<Mutex<StreamDispatcher<T>>>) -> StreamConsumer<T> {
         let id = {
@@ -186,21 +174,15 @@ where
 /// If a consumer is dropped, we need to remove it from the
 /// dispatcher's consumer list. This is required to cancel
 /// stream computations if all consumers left.
-impl<T> Drop for StreamConsumer<T>
-where
-    T: Clone,
-{
+impl<T> Drop for StreamConsumer<T> {
     fn drop(&mut self) {
         let mut lock = self.parent.lock().unwrap();
         lock.remove_consumer(self.id);
     }
 }
 
-impl<T> Stream for StreamConsumer<T>
-where
-    T: Clone,
-{
-    type Item = T;
+impl<T> Stream for StreamConsumer<T> {
+    type Item = Arc<T>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let res = {
@@ -223,7 +205,6 @@ where
 struct KeyedStreamComputation<Key, T>
 where
     Key: Hash + Clone + Eq + Send + 'static,
-    T: Clone,
 {
     key: Key,
     response: tokio::sync::oneshot::Sender<StreamConsumer<T>>,
@@ -277,7 +258,7 @@ where
 pub struct StreamExecutor<Key, T>
 where
     Key: Hash + Clone + Eq + Send + 'static,
-    T: Clone + Sync + Send + 'static,
+    T: Sync + Send + 'static,
 {
     sender: Sender<KeyedStreamComputation<Key, T>>,
     _driver: JoinHandle<()>,
@@ -286,7 +267,7 @@ where
 impl<Key, T> StreamExecutor<Key, T>
 where
     Key: Hash + Clone + Eq + Send + 'static,
-    T: Clone + Sync + Send + 'static,
+    T: Sync + Send + 'static,
 {
     /// Creates a new `Executor` instance, ready to serve computations.
     pub fn new() -> StreamExecutor<Key, T> {
@@ -387,11 +368,10 @@ where
     /// # Return
     /// A future resolving to the result of the given `stream`
     ///
-    pub async fn submit(
-        &self,
-        key: &Key,
-        stream: impl Stream<Item = T> + Send + 'static,
-    ) -> Result<impl Stream<Item = T>> {
+    pub async fn submit<F>(&self, key: &Key, stream: F) -> Result<StreamConsumer<T>>
+    where
+        F: Stream<Item = T> + Send + 'static,
+    {
         let (tx, rx) = tokio::sync::oneshot::channel::<StreamConsumer<T>>();
 
         let kc = KeyedStreamComputation {
@@ -417,12 +397,76 @@ where
     }
 }
 
+//
+#[pin_project::pin_project]
+pub struct CloningStreamConsumer<T>
+where
+    T: Clone + Sync + Send + 'static,
+{
+    #[pin]
+    consumer: StreamConsumer<T>,
+}
+
+impl<T> Stream for CloningStreamConsumer<T>
+where
+    T: Clone + Sync + Send + 'static,
+{
+    type Item = T;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        match this.consumer.poll_next(cx) {
+            Poll::Ready(Some(v)) => Poll::Ready(Some(v.as_ref().clone())),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Trait for streams with cloneable results.
+#[async_trait::async_trait]
+trait CloneableStream<Key, T>
+where
+    Key: Hash + Clone + Eq + Send + 'static,
+    T: Clone + Sync + Send + 'static,
+{
+    /// Submits a `stream` computation to the executor. The `key` is used to uniquely
+    /// identify the stream computation and lets multiple identical computations
+    /// use the same result.
+    ///
+    /// Unlike with `StreamExecutor::submit` which returns streams of `Arc<T>` to the
+    /// consumers, this methods returns a stream of `T`, by cloning the actual results.
+    ///
+    /// # Return
+    /// A future resolving to the result of the given `stream`
+    ///
+    async fn submit_clone<F>(&self, key: &Key, stream: F) -> Result<CloningStreamConsumer<T>>
+    where
+        F: Stream<Item = T> + Send + 'static;
+}
+
+#[async_trait::async_trait]
+impl<Key, T> CloneableStream<Key, T> for StreamExecutor<Key, T>
+where
+    Key: Hash + Clone + Eq + Send + Sync + 'static,
+    T: Clone + Sync + Send + 'static,
+{
+    async fn submit_clone<F>(&self, key: &Key, stream: F) -> Result<CloningStreamConsumer<T>>
+    where
+        F: Stream<Item = T> + Send + 'static,
+    {
+        let consumer = self.submit(&key, stream).await?;
+        Ok(CloningStreamConsumer { consumer })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::error::ExecutorError;
-    use crate::stream::StreamExecutor;
+    use crate::stream::{CloneableStream, StreamExecutor};
     use futures::{Stream, StreamExt};
     use std::pin::Pin;
+    use std::sync::Arc;
     use std::task::{Context, Poll};
 
     fn init_logger() {
@@ -440,7 +484,7 @@ mod tests {
             .await
             .unwrap();
 
-        let results: Vec<i32> = sf1.collect().await;
+        let results: Vec<Arc<i32>> = sf1.collect().await;
 
         assert!(results.is_empty());
         Ok(())
@@ -457,9 +501,9 @@ mod tests {
             .await
             .unwrap();
 
-        let results: Vec<i32> = sf1.collect().await;
+        let results: Vec<Arc<i32>> = sf1.collect().await;
 
-        assert_eq!(vec![1, 2, 3], results);
+        assert_eq!(vec![Arc::new(1), Arc::new(2), Arc::new(3)], results);
         Ok(())
     }
 
@@ -493,8 +537,8 @@ mod tests {
             }
         }
 
-        assert_eq!(vec![1, 2, 3], res1);
-        assert_eq!(vec![1, 2, 3], res2);
+        assert_eq!(vec![Arc::new(1), Arc::new(2), Arc::new(3)], res1);
+        assert_eq!(vec![Arc::new(1), Arc::new(2), Arc::new(3)], res2);
 
         Ok(())
     }
@@ -529,8 +573,25 @@ mod tests {
                 .await
                 .unwrap();
             // Consume a single element
-            assert_eq!(Some(1), sf.next().await)
+            assert_eq!(Some(Arc::new(1)), sf.next().await)
         }
         // How to assert this?
+    }
+
+    #[tokio::test]
+    async fn test_clone() -> Result<(), ExecutorError> {
+        init_logger();
+
+        let e = StreamExecutor::<i32, i32>::new();
+
+        let sf1 = e
+            .submit_clone(&1, tokio_stream::iter(vec![1, 2, 3]))
+            .await
+            .unwrap();
+
+        let results: Vec<i32> = sf1.collect().await;
+
+        assert_eq!(vec![1, 2, 3], results);
+        Ok(())
     }
 }
