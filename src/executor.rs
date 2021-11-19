@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{ExecutorError, Result};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
@@ -272,9 +272,15 @@ where
         };
 
         self.sender.send(kc).await?;
-        let res = rx.await?;
+        let res = rx.await?.await;
 
-        res.await
+        // Propagate panics
+        match res {
+            Ok(v) => Ok(v),
+            Err(ExecutorError::TaskPanic) => panic!("Executor task panicked!"),
+            Err(ExecutorError::TaskCancelled) => panic!("Executor task cancelled!"),
+            Err(_) => unreachable!(),
+        }
     }
 
     pub async fn close(self) -> Result<()> {
@@ -385,21 +391,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_panic() -> Result<(), ExecutorError> {
+    #[should_panic]
+    async fn test_panic() {
         init_logger();
 
         let e = Executor::new();
         let f = e.submit(&1, async { panic!("booom") });
 
-        match f.await.unwrap_err() {
-            ExecutorError::TaskPanic => {}
-            e => return Err(e),
-        };
-
-        // Ensure other tasks are running
-        let f = e.submit(&1, async { 42_u64 });
-        assert_eq!(Arc::new(42_u64), f.await?);
-        Ok(())
+        f.await;
     }
 
     #[tokio::test]
