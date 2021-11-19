@@ -398,7 +398,7 @@ mod tests {
         let e = Executor::new();
         let f = e.submit(&1, async { panic!("booom") });
 
-        f.await;
+        f.await.unwrap();
     }
 
     #[tokio::test]

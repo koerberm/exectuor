@@ -455,7 +455,7 @@ where
     where
         F: Stream<Item = T> + Send + 'static,
     {
-        let consumer = self.submit(&key, stream).await?;
+        let consumer = self.submit(key, stream).await?;
         Ok(CloningStreamConsumer { consumer })
     }
 }
