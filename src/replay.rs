@@ -124,10 +124,8 @@ where
     }
 
     fn remove_sender(&mut self, id: u32) {
-        if let Some(_) = self.senders.remove(&id) {
-            if self.senders.len() == 0 {
-                self.notify_receivers();
-            }
+        if self.senders.remove(&id).is_some() && self.senders.is_empty() {
+            self.notify_receivers();
         }
     }
 
@@ -309,7 +307,7 @@ where
     pub fn send(&self, v: T) -> Send<T> {
         let _ignore = self.pending.fetch_add(1, Ordering::Relaxed);
         Send {
-            sender: &self,
+            sender: self,
             value: Some(v),
         }
     }
@@ -421,7 +419,7 @@ where
 
     pub fn recv(&self) -> Recv<T> {
         let _ignore = self.pending.fetch_add(1, Ordering::Relaxed);
-        Recv { receiver: &self }
+        Recv { receiver: self }
     }
 
     fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
