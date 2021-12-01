@@ -28,9 +28,14 @@ struct KeyedJoinHandle<K, T>
 where
     K: Clone,
 {
+    // The computation's key
     key: K,
+    // A unique sequence number of the computation. See `ComputationEntry`
+    // for a detailed description.
     id: usize,
+    // The sender side of the replay channel.
     sender: replay::Sender<Result<Arc<T>>>,
+    // The join handle of the underlying task
     #[pin]
     handle: JoinHandle<()>,
 }
@@ -40,9 +45,14 @@ struct KeyedJoinResult<K, T>
 where
     K: Clone,
 {
+    // The computation's key
     key: K,
+    // A unique sequence number of the computation. See `ComputationEntry`
+    // for a detailed description.
     id: usize,
+    // The sender side of the replay channel.
     sender: replay::Sender<Result<Arc<T>>>,
+    // The result returned by the task.
     result: std::result::Result<(), JoinError>,
 }
 
@@ -67,6 +77,16 @@ where
 }
 
 struct ComputationEntry<T> {
+    // A unique sequence number of the computation.
+    // This is used to decide whether or not to drop computation
+    // infos after completion. If a computation task for a given key
+    // is finished, it might be that another one took its place
+    // in the list of running computations. This happens, of a computation
+    // progressed too far already and a new consumer cannot join it anymore.
+    // In those cases a new task is started and takes the slot in the list
+    // of active computation. Now, if the old computation terminates, the newly
+    // started computation must *NOT* be removed from this list.
+    // We use this ID to handle such cases.
     id: usize,
     sender: replay::Sender<Result<Arc<T>>>,
 }
@@ -114,7 +134,7 @@ where
         log::info!("Starting executor loop.");
         let mut computations: HashMap<Key, ComputationEntry<T>> = HashMap::new();
         let mut tasks = FuturesUnordered::<KeyedJoinHandle<Key, T>>::new();
-        let mut termination_msgs = FuturesUnordered::<replay::Send<Result<Arc<T>>>>::new();
+        let mut termination_msgs = FuturesUnordered::new();
         log::info!("Finished executor loop.");
         loop {
             tokio::select! {
@@ -198,14 +218,16 @@ where
 
                     match completed_task.result {
                         Err(e) => {
+                            termination_msgs.push(async move {
                             if let Ok(_err) = e.try_into_panic() {
                                 log::warn!("Stream task panicked. Notifying consumer streams.");
-                                termination_msgs.push(completed_task.sender.send(Err(ExecutorError::TaskPanic)));
+                                completed_task.sender.send(Err(ExecutorError::TaskPanic)).await
                             }
                             else {
                                 log::warn!("Stream task was cancelled. Notifying consumer streams.");
-                                termination_msgs.push(completed_task.sender.send(Err(ExecutorError::TaskCancelled)));
+                                completed_task.sender.send(Err(ExecutorError::TaskCancelled)).await
                             }
+                            });
                         }
                         Ok(_) => {
                             log::debug!("Computation finished. Notifying consumer streams.");
@@ -220,16 +242,13 @@ where
         }
     }
 
-    /// Submits a `stream` computation to this executor. The `key` is used to uniquely
-    /// identify the stream computation and lets multiple identical computations
-    /// use the same result.
+    /// Submits a streaming computation to this executor. In contrast
+    /// to `Executor.submit_stream`, this method returns a Stream of
+    /// `Arc<T>` that allows to use the executor with non-cloneable
+    /// results.
     ///
-    /// The caller is responsible for ensuring that the given key is unique
-    /// per computation.
-    ///
-    /// # Return
-    /// A future resolving to the result of the given `stream`
-    ///
+    /// #Errors
+    /// This call fails, if the `Executor` was already closed.
     pub async fn submit_stream_ref<F>(&self, key: &Key, stream: F) -> Result<StreamReceiver<T>>
     where
         F: Stream<Item = T> + Send + 'static,
@@ -248,6 +267,13 @@ where
         Ok(StreamReceiver::new(res))
     }
 
+    /// Submits a single-result computation to this executor. In contrast
+    /// to `Executor.submit`, this method returns an
+    /// `Arc<T>` that allows to use the executor with non-cloneable
+    /// results.
+    ///
+    /// #Errors
+    /// This call fails, if the `Executor` was already closed.
     pub async fn submit_ref<F>(&self, key: &Key, f: F) -> Result<Arc<T>>
     where
         F: Future<Output = T> + Send + 'static,
@@ -270,6 +296,11 @@ where
     Key: Hash + Clone + Eq + Send + 'static,
     T: Clone + Sync + Send + 'static,
 {
+    /// Submits a streaming computation to this executor. This method
+    /// returns a stream providing the results of the original (given) stream.
+    ///
+    /// #Errors
+    /// This call fails, if the `Executor` was already closed.
     pub async fn submit_stream<F>(&self, key: &Key, stream: F) -> Result<CloningStreamReceiver<T>>
     where
         F: Stream<Item = T> + Send + 'static,
@@ -278,6 +309,10 @@ where
         Ok(CloningStreamReceiver { consumer })
     }
 
+    /// Submits a single-result computation to this executor.
+    ///
+    /// #Errors
+    /// This call fails, if the `Executor` was already closed.
     pub async fn submit<F>(&self, key: &Key, f: F) -> Result<T>
     where
         F: Future<Output = T> + Send + 'static,
@@ -381,7 +416,7 @@ mod tests {
         let e = Executor::<i32, i32>::new(5);
 
         let sf1 = e
-            .submit_stream_ref(&1, tokio_stream::iter(Vec::<i32>::new()))
+            .submit_stream_ref(&1, futures::stream::iter(Vec::<i32>::new()))
             .await
             .unwrap();
 
@@ -398,7 +433,7 @@ mod tests {
         let e = Executor::<i32, i32>::new(5);
 
         let sf1 = e
-            .submit_stream_ref(&1, tokio_stream::iter(vec![1, 2, 3]))
+            .submit_stream_ref(&1, futures::stream::iter(vec![1, 2, 3]))
             .await
             .unwrap();
 
@@ -414,8 +449,8 @@ mod tests {
 
         let e = Executor::new(5);
 
-        let sf1 = e.submit_stream_ref(&1, tokio_stream::iter(vec![1, 2, 3]));
-        let sf2 = e.submit_stream_ref(&1, tokio_stream::iter(vec![1, 2, 3]));
+        let sf1 = e.submit_stream_ref(&1, futures::stream::iter(vec![1, 2, 3]));
+        let sf2 = e.submit_stream_ref(&1, futures::stream::iter(vec![1, 2, 3]));
 
         let (sf1, sf2) = tokio::join!(sf1, sf2);
 
@@ -470,7 +505,7 @@ mod tests {
         let e = Executor::new(5);
         {
             let mut sf = e
-                .submit_stream_ref(&1, tokio_stream::iter(vec![1, 2, 3]))
+                .submit_stream_ref(&1, futures::stream::iter(vec![1, 2, 3]))
                 .await
                 .unwrap();
             // Consume a single element
@@ -486,7 +521,7 @@ mod tests {
         let e = Executor::<i32, i32>::new(5);
 
         let sf1 = e
-            .submit_stream(&1, tokio_stream::iter(vec![1, 2, 3]))
+            .submit_stream(&1, futures::stream::iter(vec![1, 2, 3]))
             .await
             .unwrap();
 

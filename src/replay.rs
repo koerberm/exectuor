@@ -1,6 +1,7 @@
 use futures::Future;
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
@@ -21,7 +22,7 @@ pub enum SubscribeError {
     Closed,
 }
 
-pub fn channel<T: Clone>(queue_size: usize) -> (Sender<T>, Receiver<T>) {
+pub fn channel<T: Clone + Unpin>(queue_size: usize) -> (Sender<T>, Receiver<T>) {
     let inner = Arc::new(Mutex::new(Inner::new(queue_size)));
 
     let (tx_id, rx_id) = {
@@ -31,10 +32,12 @@ pub fn channel<T: Clone>(queue_size: usize) -> (Sender<T>, Receiver<T>) {
 
     let tx = Sender {
         id: tx_id,
+        pending: Default::default(),
         inner: inner.clone(),
     };
     let rx = Receiver {
         id: rx_id.unwrap(),
+        pending: Default::default(),
         inner,
     };
     (tx, rx)
@@ -64,25 +67,33 @@ struct InnerSender {
     waker: Option<Waker>,
 }
 
+impl InnerSender {
+    fn update_waker(&mut self, waker: &Waker) {
+        update_waker(&mut self.waker, waker);
+    }
+
+    fn remove_waker(&mut self) {
+        self.waker = None;
+    }
+}
+
 impl InnerReceiver {
     fn update_waker(&mut self, waker: &Waker) {
         update_waker(&mut self.waker, waker);
     }
-}
 
-impl InnerSender {
-    fn update_waker(&mut self, waker: &Waker) {
-        update_waker(&mut self.waker, waker);
+    fn remove_waker(&mut self) {
+        self.waker = None;
     }
 }
 
 fn update_waker(opt: &mut Option<Waker>, waker: &Waker) {
     match opt {
-        Some(w) if waker.will_wake(w) => {}
+        Some(w) if w.will_wake(waker) => {}
         _ => {
-            let _ignore = opt.insert(waker.clone());
+            let _ignore = opt.replace(waker.clone());
         }
-    }
+    };
 }
 
 impl<T> Inner<T>
@@ -150,9 +161,9 @@ where
 
     fn notify_senders(&mut self) {
         for v in self.senders.values_mut() {
-            if let Some(waker) = v.waker.take() {
-                waker.wake();
-            };
+            if let Some(w) = v.waker.take() {
+                w.wake();
+            }
         }
     }
 
@@ -161,6 +172,10 @@ where
             .get_mut(&sender_id)
             .unwrap()
             .update_waker(waker);
+    }
+
+    fn remove_send_waker(&mut self, sender_id: u32) {
+        self.senders.get_mut(&sender_id).unwrap().remove_waker();
     }
 
     fn create_receiver(&mut self, first: bool) -> Result<u32, SubscribeError> {
@@ -231,10 +246,14 @@ where
 
     fn notify_receivers(&mut self) {
         for v in self.receivers.values_mut() {
-            if let Some(waker) = v.waker.take() {
-                waker.wake();
-            };
+            if let Some(w) = v.waker.take() {
+                w.wake();
+            }
         }
+    }
+
+    fn remove_receiver_waker(&mut self, receiver_id: u32) {
+        self.receivers.get_mut(&receiver_id).unwrap().remove_waker()
     }
 
     fn update_receiver_waker(&mut self, receiver_id: u32, waker: &Waker) {
@@ -256,6 +275,7 @@ where
     T: Clone,
 {
     id: u32,
+    pending: AtomicUsize,
     inner: Arc<Mutex<Inner<T>>>,
 }
 
@@ -271,6 +291,7 @@ where
 
         Ok(Receiver {
             id,
+            pending: Default::default(),
             inner: self.inner.clone(),
         })
     }
@@ -279,12 +300,42 @@ where
         let mut lock = self.inner.lock().unwrap();
         lock.try_send(v)
     }
+}
 
+impl<T> Sender<T>
+where
+    T: Clone + Unpin,
+{
     pub fn send(&self, v: T) -> Send<T> {
+        let _ignore = self.pending.fetch_add(1, Ordering::Relaxed);
         Send {
-            id: self.id,
-            inner: self.inner.clone(),
+            sender: &self,
             value: Some(v),
+        }
+    }
+
+    fn poll_send(
+        &self,
+        send: &mut Send<'_, T>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), SendError<T>>> {
+        let value = send.value.take().unwrap();
+        let mut lock = self.inner.lock().unwrap();
+        match lock.try_send(value) {
+            Ok(_) => Poll::Ready(Ok(())),
+            Err(SendError::Full(v)) => {
+                lock.update_send_waker(self.id, cx.waker());
+                let _ignore = send.value.insert(v);
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+
+    fn send_dropped(&self) {
+        if self.pending.fetch_sub(1, Ordering::Relaxed) == 1 {
+            let mut lock = self.inner.lock().unwrap();
+            lock.remove_send_waker(self.id);
         }
     }
 }
@@ -300,6 +351,7 @@ where
         };
         Sender {
             id,
+            pending: Default::default(),
             inner: self.inner.clone(),
         }
     }
@@ -315,34 +367,31 @@ where
     }
 }
 
-#[pin_project::pin_project]
-pub struct Send<T>
+pub struct Send<'sender, T>
 where
-    T: Clone,
+    T: Clone + Unpin,
 {
-    id: u32,
-    inner: Arc<Mutex<Inner<T>>>,
+    sender: &'sender Sender<T>,
     value: Option<T>,
 }
 
-impl<T> Future for Send<T>
+impl<T> Drop for Send<'_, T>
 where
-    T: Clone,
+    T: Clone + Unpin,
+{
+    fn drop(&mut self) {
+        self.sender.send_dropped();
+    }
+}
+
+impl<T> Future for Send<'_, T>
+where
+    T: Clone + Unpin,
 {
     type Output = Result<(), SendError<T>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let mut lock = this.inner.lock().unwrap();
-        match lock.try_send(this.value.take().unwrap()) {
-            Ok(_) => Poll::Ready(Ok(())),
-            Err(SendError::Full(v)) => {
-                let _ignore = this.value.insert(v);
-                lock.update_send_waker(*this.id, cx.waker());
-                Poll::Pending
-            }
-            Err(e) => Poll::Ready(Err(e)),
-        }
+        self.sender.poll_send(self.get_mut(), cx)
     }
 }
 
@@ -357,6 +406,7 @@ where
     T: Clone,
 {
     id: u32,
+    pending: AtomicUsize,
     inner: Arc<Mutex<Inner<T>>>,
 }
 
@@ -370,9 +420,26 @@ where
     }
 
     pub fn recv(&self) -> Recv<T> {
-        Recv {
-            id: self.id,
-            inner: self.inner.clone(),
+        let _ignore = self.pending.fetch_add(1, Ordering::Relaxed);
+        Recv { receiver: &self }
+    }
+
+    fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        let mut lock = self.inner.lock().unwrap();
+        match lock.try_recv(self.id) {
+            Ok(v) => Poll::Ready(Some(v)),
+            Err(ReceiveError::Closed) => Poll::Ready(None),
+            Err(ReceiveError::NoMessage) => {
+                lock.update_receiver_waker(self.id, cx.waker());
+                Poll::Pending
+            }
+        }
+    }
+
+    pub fn recv_dropped(&self) {
+        if self.pending.fetch_sub(1, Ordering::Relaxed) == 1 {
+            let mut lock = self.inner.lock().unwrap();
+            lock.remove_receiver_waker(self.id);
         }
     }
 }
@@ -387,32 +454,30 @@ where
     }
 }
 
-#[pin_project::pin_project]
-pub struct Recv<T>
+pub struct Recv<'receiver, T>
 where
     T: Clone,
 {
-    id: u32,
-    inner: Arc<Mutex<Inner<T>>>,
+    receiver: &'receiver Receiver<T>,
 }
 
-impl<T> Future for Recv<T>
+impl<T> Drop for Recv<'_, T>
+where
+    T: Clone,
+{
+    fn drop(&mut self) {
+        self.receiver.recv_dropped();
+    }
+}
+
+impl<T> Future for Recv<'_, T>
 where
     T: Clone,
 {
     type Output = Option<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let mut lock = this.inner.lock().unwrap();
-        match lock.try_recv(*this.id) {
-            Ok(v) => Poll::Ready(Some(v)),
-            Err(ReceiveError::Closed) => Poll::Ready(None),
-            Err(ReceiveError::NoMessage) => {
-                lock.update_receiver_waker(*this.id, cx.waker());
-                Poll::Pending
-            }
-        }
+        self.receiver.poll_recv(cx)
     }
 }
 
@@ -420,6 +485,7 @@ where
 mod tests {
     use super::*;
     use std::matches;
+    use tokio::time::Duration;
 
     #[test]
     fn test_send() {
@@ -598,5 +664,57 @@ mod tests {
         assert!(matches!(rx.recv().await, Some(2)));
         assert!(matches!(rx.recv().await, Some(3)));
         assert!(matches!(rx.recv().await, None));
+    }
+
+    #[tokio::test]
+    async fn test_multiple_waiting() {
+        let (tx, rx) = channel(2);
+
+        let f1 = tx.send(1);
+        let f2 = tx.send(2);
+        let f3 = tx.send(3);
+        let f4 = tx.send(4);
+
+        let (_r1, _r2) = tokio::join!(f1, f2);
+        let (_tx1, _tx2, r1, r2, r3, r4) =
+            tokio::join!(f3, f4, rx.recv(), rx.recv(), rx.recv(), rx.recv());
+
+        assert_eq!(Some(1), r1);
+        assert_eq!(Some(2), r2);
+        assert_eq!(Some(3), r3);
+        assert_eq!(Some(4), r4);
+    }
+
+    #[tokio::test]
+    async fn test_send_multiple_tasks() {
+        let (tx, rx) = channel(2);
+        let rx2 = tx.subscribe().unwrap();
+
+        let t = tokio::spawn(async move {
+            let f1 = tx.send(1);
+            let f2 = tx.send(2);
+            let f3 = tx.send(3);
+            let (_, _, _) = tokio::join!(f1, f2, f3);
+        });
+
+        let rt = {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let (r1, r2, r3, r4) = tokio::join!(rx2.recv(), rx2.recv(), rx2.recv(), rx2.recv());
+                assert_eq!(Some(1), r1);
+                assert_eq!(Some(2), r2);
+                assert_eq!(Some(3), r3);
+                assert_eq!(None, r4);
+            })
+        };
+
+        let (r1, r2, r3, r4) = tokio::join!(rx.recv(), rx.recv(), rx.recv(), rx.recv());
+
+        assert_eq!(Some(1), r1);
+        assert_eq!(Some(2), r2);
+        assert_eq!(Some(3), r3);
+        assert_eq!(None, r4);
+
+        let (_, _) = tokio::join!(t, rt);
     }
 }
