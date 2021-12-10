@@ -5,20 +5,29 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
+/// Possible errors when sending data to the channel
 pub enum SendError<T> {
+    /// The channel is closed (i.e., all receivers were dropped)
     Closed(T),
+    /// The replay buffer is full - try again later
     Full(T),
 }
 
+/// Possible errors when sending data to the channel
 #[derive(Clone, Debug)]
 pub enum ReceiveError {
+    /// The channel is closed - no more data will be delivered
     Closed,
+    /// Currently no message present - try again later
     NoMessage,
 }
 
+/// Possible errors when subscribing to the channel
 #[derive(Clone, Debug)]
 pub enum SubscribeError {
+    /// The channel progressed too far, joining not possible anymore
     WouldLag,
+    /// The channel is closed already, joining not possible anymore
     Closed,
 }
 

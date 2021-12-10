@@ -1,5 +1,7 @@
 use crate::error::{ExecutorError, Result};
 use crate::replay;
+use crate::replay::SendError;
+use futures::future::BoxFuture;
 use futures::stream::{BoxStream, FuturesUnordered};
 use futures::{Future, Stream, StreamExt};
 use std::collections::HashMap;
@@ -76,6 +78,10 @@ where
     }
 }
 
+/// An entry for the map of currently running computations.
+/// It contains a sender from the associated replay channel
+/// in order to register new consumers.
+/// See `replay::Sender::subscribe`.
 struct ComputationEntry<T> {
     // A unique sequence number of the computation.
     // This is used to decide whether or not to drop computation
@@ -89,6 +95,201 @@ struct ComputationEntry<T> {
     // We use this ID to handle such cases.
     id: usize,
     sender: replay::Sender<Result<Arc<T>>>,
+}
+
+/// This encapsulates the main loop of the executor task.
+/// It manages all new, running and finished computations.
+struct ExecutorLooper<Key, T>
+where
+    Key: Hash + Clone + Eq + Send + 'static,
+    T: Sync + Send + 'static,
+{
+    buffer_size: usize,
+    receiver: mpsc::Receiver<KeyedComputation<Key, T>>,
+    computations: HashMap<Key, ComputationEntry<T>>,
+    tasks: FuturesUnordered<KeyedJoinHandle<Key, T>>,
+    termination_msgs: FuturesUnordered<
+        BoxFuture<
+            'static,
+            std::result::Result<(), SendError<std::result::Result<Arc<T>, ExecutorError>>>,
+        >,
+    >,
+}
+
+impl<Key, T> ExecutorLooper<Key, T>
+where
+    Key: Hash + Clone + Eq + Send + 'static,
+    T: Sync + Send + 'static,
+{
+    /// Creates a new Looper.
+    fn new(
+        buffer_size: usize,
+        receiver: mpsc::Receiver<KeyedComputation<Key, T>>,
+    ) -> ExecutorLooper<Key, T> {
+        ExecutorLooper {
+            buffer_size,
+            receiver,
+            computations: HashMap::new(),
+            tasks: FuturesUnordered::new(),
+            termination_msgs: FuturesUnordered::new(),
+        }
+    }
+
+    /// Handles a new computation request. It first tries to join
+    /// a running computation. If this is not possible, a new
+    /// computation is started.
+    fn handle_new_task(&mut self, kc: KeyedComputation<Key, T>) {
+        log::debug!("Received new stream request.");
+        let key = kc.key;
+
+        let entry = self.computations.entry(key.clone());
+        let receiver = match entry {
+            // There is a computation running
+            std::collections::hash_map::Entry::Occupied(mut oe) => {
+                match oe.get().sender.subscribe() {
+                    Ok(rx) => {
+                        log::debug!("Attaching request to existing stream.");
+                        rx
+                    }
+                    // Stream progressed too far, start a new one
+                    Err(_) => {
+                        log::debug!(
+                            "Stream progressed too far. Starting new computation for request."
+                        );
+                        let new_id = oe.get().id + 1;
+                        let (entry, rx) = Self::start_computation(
+                            self.buffer_size,
+                            new_id,
+                            key,
+                            kc.stream,
+                            &mut self.tasks,
+                        );
+                        oe.insert(entry);
+                        rx
+                    }
+                }
+            }
+            // Start a new computation
+            std::collections::hash_map::Entry::Vacant(ve) => {
+                log::debug!("Starting new computation for request.");
+                let (entry, rx) =
+                    Self::start_computation(self.buffer_size, 0, key, kc.stream, &mut self.tasks);
+                ve.insert(entry);
+                rx
+            }
+        };
+
+        if kc.response.send(receiver).is_err() {
+            log::error!("Could not pass back proxied stream.")
+        }
+    }
+
+    /// Starts a new computation. It spawns a separate task
+    /// in which the computation is executed. Therefore it establishes
+    /// a new `replay::channel` and returns infos about the computation
+    /// and the receiving side of the replay channel.
+    fn start_computation(
+        buffer_size: usize,
+        id: usize,
+        key: Key,
+        mut stream: BoxStream<'static, T>,
+        tasks: &mut FuturesUnordered<KeyedJoinHandle<Key, T>>,
+    ) -> (ComputationEntry<T>, replay::Receiver<Result<Arc<T>>>) {
+        let (tx, rx) = replay::channel(buffer_size);
+
+        let entry = ComputationEntry {
+            id,
+            sender: tx.clone(),
+        };
+
+        let jh = {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                while let Some(v) = stream.next().await {
+                    if let Err(replay::SendError::Closed(_)) = tx.send(Ok(Arc::new(v))).await {
+                        log::debug!("All consumers left. Cancelling task.");
+                        break;
+                    }
+                }
+            })
+        };
+
+        tasks.push(KeyedJoinHandle {
+            key,
+            id,
+            sender: tx,
+            handle: jh,
+        });
+        (entry, rx)
+    }
+
+    /// Handles computations that ran to completion. It removes
+    /// them from the map of running computations and notifies
+    /// consumers. Furthermore, if the computation task was cancelled
+    /// or panicked, this is also propagated.
+    ///
+    fn handle_completed_task(&mut self, completed_task: KeyedJoinResult<Key, T>) {
+        let id = completed_task.id;
+
+        // Remove the map entry only, if the completed task's id matches the stored task's id
+        if let std::collections::hash_map::Entry::Occupied(e) =
+            self.computations.entry(completed_task.key)
+        {
+            if e.get().id == id {
+                e.remove();
+            }
+        }
+
+        match completed_task.result {
+            Err(e) => {
+                self.termination_msgs.push(Box::pin(async move {
+                    if let Ok(_) = e.try_into_panic() {
+                        log::warn!("Stream task panicked. Notifying consumer streams.");
+                        completed_task
+                            .sender
+                            .send(Err(ExecutorError::TaskPanic))
+                            .await
+                    } else {
+                        log::warn!("Stream task was cancelled. Notifying consumer streams.");
+                        completed_task
+                            .sender
+                            .send(Err(ExecutorError::TaskCancelled))
+                            .await
+                    }
+                }));
+            }
+            Ok(_) => {
+                log::debug!("Computation finished. Notifying consumer streams.");
+                // After destroying the sender all remaining receivers will receive end-of-stream
+            }
+        }
+    }
+
+    /// This is the main loop. Here we check for new and completed tasks,
+    /// and also drive termination messages forward.
+    pub async fn main_loop(&mut self) {
+        log::info!("Starting executor loop.");
+        loop {
+            tokio::select! {
+                new_task = self.receiver.recv() => {
+                    if let Some(kc) = new_task {
+                        self.handle_new_task(kc);
+                    }
+                    else {
+                        log::info!("Executor terminated.");
+                        break;
+                    }
+                },
+                Some(completed_task) = self.tasks.next() => {
+                    self.handle_completed_task(completed_task);
+                },
+                Some(_) = self.termination_msgs.next() => {
+                    log::debug!("Successfully delivered termination message.");
+                }
+            }
+        }
+        log::info!("Finished executor loop.");
+    }
 }
 
 /// The `Executor` runs async (streaming) computations. It allows multiple consumers
@@ -117,128 +318,15 @@ where
     pub fn new(buffer_size: usize) -> Executor<Key, T> {
         let (sender, receiver) = tokio::sync::mpsc::channel::<KeyedComputation<Key, T>>(128);
 
+        let mut looper = ExecutorLooper::new(buffer_size, receiver);
+
         // This is the task that is responsible for driving the async computations and
         // notifying consumers about success and failure.
-        let driver = tokio::spawn(Self::executor_loop(buffer_size, receiver));
+        let driver = tokio::spawn(async move { looper.main_loop().await });
 
         Executor {
             sender,
             _driver: driver,
-        }
-    }
-
-    async fn executor_loop(
-        buffer_size: usize,
-        mut receiver: mpsc::Receiver<KeyedComputation<Key, T>>,
-    ) {
-        log::info!("Starting executor loop.");
-        let mut computations: HashMap<Key, ComputationEntry<T>> = HashMap::new();
-        let mut tasks = FuturesUnordered::<KeyedJoinHandle<Key, T>>::new();
-        let mut termination_msgs = FuturesUnordered::new();
-        log::info!("Finished executor loop.");
-        loop {
-            tokio::select! {
-                new_task = receiver.recv() => {
-                    if let Some(mut kc) = new_task {
-                        log::debug!("Received new stream request.");
-                        let key = kc.key;
-                        let receiver = match computations.entry(key.clone()) {
-                            // There is a computation running
-                            std::collections::hash_map::Entry::Occupied(mut oe) => {
-                                match oe.get().sender.subscribe() {
-                                    Ok(rx) => {
-                                        log::debug!("Attaching request to existing stream.");
-                                        rx
-                                    },
-                                    // Stream progressed too far, start a new one
-                                    Err(_) => {
-                                        log::debug!("Stream progressed too far. Starting new computation for request.");
-                                        let (tx,rx) = replay::channel(buffer_size);
-                                        let new_id = oe.get().id + 1;
-                                        oe.insert(ComputationEntry { id: new_id, sender: tx.clone() });
-
-                                        let jh = {
-                                            let tx = tx.clone();
-                                            tokio::spawn(async move {
-                                                while let Some(v) = kc.stream.next().await {
-                                                    if let Err(replay::SendError::Closed(_)) = tx.send(Ok(Arc::new(v))).await {
-                                                        log::debug!("All consumers left. Cancelling task.");
-                                                        break;
-                                                    }
-                                                }
-                                            })
-                                        };
-                                        tasks.push( KeyedJoinHandle { key: key.clone(), id: new_id, sender: tx, handle: jh });
-                                        rx
-                                    },
-                                }
-                            }
-                            // Start a new computation
-                            std::collections::hash_map::Entry::Vacant(ve) => {
-                                log::debug!("Starting new computation for request.");
-                                let (tx,rx) = replay::channel(buffer_size);
-                                ve.insert(ComputationEntry { id: 0, sender: tx.clone() });
-
-                                let jh = {
-                                    let tx = tx.clone();
-                                    tokio::spawn(async move {
-                                        while let Some(v) = kc.stream.next().await {
-                                            if let Err(replay::SendError::Closed(_)) = tx.send(Ok(Arc::new(v))).await {
-                                                log::debug!("All consumers left. Cancelling task.");
-                                                break;
-                                            }
-                                        }
-                                    })
-                                };
-                                tasks.push( KeyedJoinHandle { key: key.clone(), id: 0, sender: tx, handle: jh });
-                                rx
-                            }
-                        };
-
-                        if kc.response.send(receiver).is_err() {
-                            log::error!("Could not pass back proxied stream.")
-                        }
-                    }
-                    else {
-                        log::info!("Executor terminated.");
-                        break;
-                    }
-                },
-                Some(completed_task) = tasks.next() => {
-                    let completed_task: KeyedJoinResult<Key, T> = completed_task;
-
-                    let id = completed_task.id;
-
-                    // Remove the map entry only, if the completed task's id matches the stored task's id
-                    if let std::collections::hash_map::Entry::Occupied(e) =  computations.entry(completed_task.key) {
-                        if e.get().id == id {
-                            e.remove();
-                        }
-                    }
-
-                    match completed_task.result {
-                        Err(e) => {
-                            termination_msgs.push(async move {
-                            if let Ok(_err) = e.try_into_panic() {
-                                log::warn!("Stream task panicked. Notifying consumer streams.");
-                                completed_task.sender.send(Err(ExecutorError::TaskPanic)).await
-                            }
-                            else {
-                                log::warn!("Stream task was cancelled. Notifying consumer streams.");
-                                completed_task.sender.send(Err(ExecutorError::TaskCancelled)).await
-                            }
-                            });
-                        }
-                        Ok(_) => {
-                            log::debug!("Computation finished. Notifying consumer streams.");
-                            // After destroying the sender all remaining receivers will receive end-of-stream
-                        }
-                    }
-                },
-                Some(_) = termination_msgs.next() => {
-                    log::debug!("Successfully delivered termination message.");
-                }
-            }
         }
     }
 
@@ -325,7 +413,7 @@ where
 impl<Key, T> Default for Executor<Key, T>
 where
     Key: Hash + Clone + Eq + Send + 'static,
-    T: Clone + Sync + Send + 'static,
+    T: Sync + Send + 'static,
 {
     fn default() -> Self {
         Self::new(5)
