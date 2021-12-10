@@ -97,6 +97,9 @@ struct ComputationEntry<T> {
     sender: replay::Sender<Result<Arc<T>>>,
 }
 
+type TerminationMessage<T> =
+    std::result::Result<(), SendError<std::result::Result<Arc<T>, ExecutorError>>>;
+
 /// This encapsulates the main loop of the executor task.
 /// It manages all new, running and finished computations.
 struct ExecutorLooper<Key, T>
@@ -108,12 +111,7 @@ where
     receiver: mpsc::Receiver<KeyedComputation<Key, T>>,
     computations: HashMap<Key, ComputationEntry<T>>,
     tasks: FuturesUnordered<KeyedJoinHandle<Key, T>>,
-    termination_msgs: FuturesUnordered<
-        BoxFuture<
-            'static,
-            std::result::Result<(), SendError<std::result::Result<Arc<T>, ExecutorError>>>,
-        >,
-    >,
+    termination_msgs: FuturesUnordered<BoxFuture<'static, TerminationMessage<T>>>,
 }
 
 impl<Key, T> ExecutorLooper<Key, T>
@@ -243,7 +241,7 @@ where
         match completed_task.result {
             Err(e) => {
                 self.termination_msgs.push(Box::pin(async move {
-                    if let Ok(_) = e.try_into_panic() {
+                    if e.try_into_panic().is_ok() {
                         log::warn!("Stream task panicked. Notifying consumer streams.");
                         completed_task
                             .sender
